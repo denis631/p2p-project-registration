@@ -3,13 +3,15 @@ import java.nio.ByteBuffer
 import java.security.MessageDigest
 
 import Event.{EnrollInit, EnrollRegister}
+import RegistrationActor.RegistrationResponse
 import akka.actor.ActorSystem
+import akka.io.Tcp.SO.KeepAlive
 import akka.stream.ActorMaterializer
-import akka.stream.scaladsl.Tcp.{IncomingConnection, ServerBinding}
-import akka.stream.scaladsl.{Flow, Source, Tcp}
-import akka.util.ByteString
+import akka.stream.scaladsl.{Flow, Tcp}
+import akka.util.{ByteString, Timeout}
 
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.ExecutionContext
+import scala.concurrent.duration._
 
 sealed trait Event {
   def size: Short
@@ -23,12 +25,15 @@ object Event {
     val size = fieldToShort(0)
     val status = fieldToShort(1)
 
-    status match {
+    val event = status match {
       case 680 => EnrollInit(size, message.drop(4).asByteBuffer.getLong)
       case 682 => EnrollSuccess(size, fieldToShort(2), fieldToShort(3))
-      case 683 => EnrollFailure(size, fieldToShort(2), fieldToShort(3), message.drop(8).toString)
+      case 683 => EnrollFailure(size, fieldToShort(2), fieldToShort(3), message.drop(8).utf8String)
       case _ => ???
     }
+
+    println(event)
+    event
   }
 
   final case class EnrollInit(size: Short, challenge: Long) extends Event
@@ -43,7 +48,11 @@ object Event {
       def longToBytes(x: Long): List[Byte] = ByteBuffer.allocate(8).putLong(x).array().toList
       def shortToBytes(x: Short): List[Byte] = ByteBuffer.allocate(2).putShort(x).array().toList
 
-      val bytes = longToBytes(challenge) ++ shortToBytes(teamNumber) ++ shortToBytes(projectChoice) ++ credentialsBytes.toList
+      val bytes = longToBytes(challenge) ++
+        shortToBytes(teamNumber) ++
+        shortToBytes(projectChoice) ++
+        longToBytes(nonce) ++
+        credentialsBytes.toList
 
       MessageDigest.getInstance("SHA-256")
         .digest(bytes.toArray)
@@ -62,7 +71,7 @@ object Event {
         .putLong(nonce)
         .put(credentialsBytes)
 
-      ByteString(byteBuffer.toString)
+      ByteString(byteBuffer.array())
     }
   }
 }
@@ -71,22 +80,22 @@ object RegistrationStarter extends App {
   implicit val system: ActorSystem = ActorSystem("ProjectRegistration")
   implicit val materializer: ActorMaterializer = ActorMaterializer()
   implicit val ec: ExecutionContext = system.dispatcher
+  implicit val timeout: Timeout = Timeout(24 hours)//Timeout(5 seconds)
 
   val host = "fulcrum.net.in.tum.de"
   val port = 34151
   val socketAddress = new InetSocketAddress(host, port)
 
-  val clientFlow = Tcp().outgoingConnection(new InetSocketAddress(host, port))
+  val registrationActor = system.actorOf(RegistrationActor.props)
+  val clientFlow = Tcp().outgoingConnection(new InetSocketAddress(host, port), options = KeepAlive(true) :: Nil)
 
   val processingFlow = Flow[ByteString]
     .map(Event.parse)
     .map { case init: EnrollInit =>
-      println(init)
-      EnrollRegister(init.challenge, 0, 4963, "x@mytum.de", "", "_")
+      EnrollRegister(init.challenge, 0, 4963, "ga92xav@mytum.de", "Denis", "Grebennicov")
     }
-    // ask multiple actors
-    // have an actor pool which you ask and take the first value received
-    .map(_.toByteString(1))
+    .ask[RegistrationResponse](registrationActor)
+    .map { response => response.msg.toByteString(response.nonce) }
 
   clientFlow.join(processingFlow).run()
 }
